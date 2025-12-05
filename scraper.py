@@ -48,6 +48,7 @@ class PowercutScraper:
 
         # Collect all schedules: date -> queue_number -> time_slots
         all_schedules = {}
+        modifications_by_date = {}
         
         for message in messages:
             date = self.extract_date(message.get_text())
@@ -62,15 +63,109 @@ class PowercutScraper:
                 if date_obj >= today:
                     if date not in all_schedules:
                         all_schedules[date] = {}
+                    if date not in modifications_by_date:
+                        modifications_by_date[date] = {}
                     
-                    # Combine overlapping time slots for each queue
+                    # Separate regular schedules from modifications
                     for queue_num, time_slots in schedules_by_queue.items():
-                        combined_slots = self.combine_time_slots(date, time_slots)
-                        if combined_slots:
-                            all_schedules[date][queue_num] = combined_slots
-                            print(f'Found schedules for {date}, Queue {queue_num}: {combined_slots}')
+                        regular_slots = []
+                        mods = []
+                        
+                        for slot in time_slots:
+                            if slot.startswith("MOD:"):
+                                mods.append(slot)
+                            else:
+                                regular_slots.append(slot)
+                        
+                        if regular_slots:
+                            combined_slots = self.combine_time_slots(date, regular_slots)
+                            if combined_slots:
+                                all_schedules[date][queue_num] = combined_slots
+                                print(f'Found schedules for {date}, Queue {queue_num}: {combined_slots}')
+                        
+                        if mods:
+                            if queue_num not in modifications_by_date[date]:
+                                modifications_by_date[date][queue_num] = []
+                            modifications_by_date[date][queue_num].extend(mods)
+        
+        # Apply modifications to schedules
+        self.apply_modifications(all_schedules, modifications_by_date)
         
         return all_schedules
+    
+    def apply_modifications(self, schedules: Dict[str, Dict[float, List[str]]], 
+                           modifications: Dict[str, Dict[float, List[str]]]):
+        """Apply schedule modifications (prolongations, early starts) to existing schedules
+        
+        Args:
+            schedules: The main schedules dict to modify
+            modifications: Dict of modifications to apply
+        """
+        for date, queue_mods in modifications.items():
+            if date not in schedules:
+                schedules[date] = {}
+            
+            for queue_num, mod_list in queue_mods.items():
+                for mod in mod_list:
+                    # Parse modification: "MOD:prolong:13:00" or "MOD:early_start:11:00"
+                    parts = mod.split(':')
+                    if len(parts) >= 3:
+                        mod_type = parts[1]
+                        mod_time = f"{parts[2]}:{parts[3]}"
+                        
+                        if queue_num in schedules[date]:
+                            existing_slots = schedules[date][queue_num]
+                            modified_slots = self.modify_time_slots(
+                                existing_slots, mod_type, mod_time, date
+                            )
+                            schedules[date][queue_num] = modified_slots
+                            print(f"Applied {mod_type} modification to queue {queue_num} on {date}: {modified_slots}")
+                        elif mod_type == 'cancel':
+                            # Remove the queue if cancelled
+                            if queue_num in schedules[date]:
+                                del schedules[date][queue_num]
+                                print(f"Cancelled schedule for queue {queue_num} on {date}")
+    
+    def modify_time_slots(self, time_slots: List[str], mod_type: str, 
+                         mod_time: str, date: str) -> List[str]:
+        """Modify time slots based on modification type
+        
+        Args:
+            time_slots: Existing time slots like ["07:00-10:00", "14:00-18:00"]
+            mod_type: 'prolong' or 'early_start'
+            mod_time: Time for modification like "13:00"
+            date: Date string for parsing
+        
+        Returns:
+            Modified list of time slots
+        """
+        if not time_slots:
+            return time_slots
+        
+        modified = []
+        
+        for slot in time_slots:
+            start_time, end_time = slot.split('-')
+            
+            if mod_type == 'prolong':
+                # Extend the end time of the last slot
+                modified.append(f"{start_time}-{mod_time}")
+            elif mod_type == 'early_start':
+                # Start the first slot earlier
+                modified.append(f"{mod_time}-{end_time}")
+            else:
+                modified.append(slot)
+        
+        # If prolonging, update only the last slot
+        if mod_type == 'prolong' and len(time_slots) > 1:
+            modified = time_slots[:-1] + [f"{time_slots[-1].split('-')[0]}-{mod_time}"]
+        # If early start, update only the first slot
+        elif mod_type == 'early_start' and len(time_slots) > 1:
+            modified = [f"{mod_time}-{time_slots[0].split('-')[1]}"] + time_slots[1:]
+        
+        # Recombine slots in case modification created overlap
+        return self.combine_time_slots(date, modified)
+    
 
     def extract_all_schedules(self, message: str) -> Dict[float, List[str]]:
         """Extract schedule time slots for ALL queue numbers found in message
@@ -82,7 +177,7 @@ class PowercutScraper:
         schedules_by_queue = {}
         
         # Pattern: "3.1 черга: з 07:00 до 10:00; з 14:00 до 18:00"
-        pattern = re.compile(r'([\d.]+)\W*черга:\s*((?:\W+з\s\d{2}:\d{2}\sдо\s\d{2}:\d{2};?)+)')
+        pattern = re.compile(r'([\d.]+)\W*черг[аи]:\s*((?:\W+з\s\d{2}:\d{2}\sдо\s\d{2}:\d{2};?)+)', re.IGNORECASE)
         schedules_pattern = re.compile(r'з\s(\d{2}:\d{2})\sдо\s(\d{2}:\d{2})')
         
         for match in pattern.finditer(message):
@@ -100,13 +195,15 @@ class PowercutScraper:
 
         # Old style schedule matching: "з 07:00 до 10:00 відключається 1, 2, 3.1 черги"
         old_pattern = re.compile(
-            r'(?:з\s(\d{2}:\d{2}\sдо\s\d{2}:\d{2});?)\sвідключа[ює]ться*([0-9\sта,.;:!?]*черг[аи])+')
+            r'(?:з\s(\d{2}:\d{2})\sдо\s(\d{2}:\d{2});?)\sвідключа[ює]ться*([0-9\sта,.;:!?]*черг[аи])+', re.IGNORECASE)
         matches = old_pattern.findall(message)
 
         if matches:
             for match in matches:
-                time_range = match[0].replace(" до ", "-")
-                queue_info = match[1]
+                start_time = match[0]
+                end_time = match[1]
+                time_range = f"{start_time}-{end_time}"
+                queue_info = match[2]
                 
                 # Extract all numbers (including decimals) from queue_info
                 queue_numbers = re.findall(r'[\d.]+', queue_info)
@@ -116,8 +213,61 @@ class PowercutScraper:
                     if queue_number not in schedules_by_queue:
                         schedules_by_queue[queue_number] = []
                     schedules_by_queue[queue_number].append(time_range)
+        
+        # Check for schedule modifications
+        modifications = self.extract_modifications(message)
+        if modifications:
+            for queue_number, mod_type, mod_time in modifications:
+                if queue_number not in schedules_by_queue:
+                    schedules_by_queue[queue_number] = []
+                # Store modification info as special time slot that will be processed later
+                schedules_by_queue[queue_number].append(f"MOD:{mod_type}:{mod_time}")
 
         return schedules_by_queue
+
+    def extract_modifications(self, message: str) -> List[tuple]:
+        """Extract schedule modifications (prolongations, early starts, etc.)
+        
+        Returns:
+            List of tuples: (queue_number, modification_type, time)
+            modification_type: 'prolong', 'early_start', 'cancel'
+        """
+        modifications = []
+        message_lower = message.lower()
+        
+        # Pattern for prolongation: "до 13:00 подовжено відключення підчерги 2.1"
+        prolong_pattern = re.compile(
+            r'до\s(\d{2}:\d{2})\sподовжен[оа]\s+(?:відключення\s+)?(?:під)?черг[аиу]\s+([\d.]+)', 
+            re.IGNORECASE
+        )
+        for match in prolong_pattern.finditer(message):
+            time = match.group(1)
+            queue = float(match.group(2))
+            modifications.append((queue, 'prolong', time))
+            print(f"Found prolongation for queue {queue} until {time}")
+        
+        # Pattern for early start: "з 11:00 додатково застосовуватиметься відключення підчерги 4.2"
+        early_pattern = re.compile(
+            r'з\s(\d{2}:\d{2})\s+додатково\s+(?:застосовуватиметься|застосовується)\s+(?:відключення\s+)?(?:під)?черг[аиу]\s+([\d.]+)',
+            re.IGNORECASE
+        )
+        for match in early_pattern.finditer(message):
+            time = match.group(1)
+            queue = float(match.group(2))
+            modifications.append((queue, 'early_start', time))
+            print(f"Found early start for queue {queue} at {time}")
+        
+        # Pattern for cancellation: "скасовано відключення черги 3.1"
+        cancel_pattern = re.compile(
+            r'скасован[оа]\s+(?:відключення\s+)?(?:під)?черг[аиу]\s+([\d.]+)',
+            re.IGNORECASE
+        )
+        for match in cancel_pattern.finditer(message):
+            queue = float(match.group(1))
+            modifications.append((queue, 'cancel', '00:00'))
+            print(f"Found cancellation for queue {queue}")
+        
+        return modifications
 
     def extract_date(self, message: str) -> Optional[str]:
         """Extract date from message text"""
@@ -303,7 +453,7 @@ class PowercutScraper:
             time_slots: List of time ranges like ["07:00-10:00", "14:00-18:00"]
         
         Returns:
-            Dictionary with hour keys (1-24) and values ('yes' or 'no')
+            Dictionary with hour keys (1-24) and values ('yes', 'no', 'first', or 'second')
         """
         # Start with all hours having power
         hours = self.create_default_hours()
@@ -316,29 +466,48 @@ class PowercutScraper:
             end_hour = int(end_time.split(':')[0])
             end_min = int(end_time.split(':')[1])
             
-            # Handle outages
+            # Convert to decimal hours for easier calculation
+            outage_start = start_hour + (start_min / 60.0)
+            outage_end = end_hour + (end_min / 60.0)
+            
+            # Process each hour
             for hour in range(24):
-                hour_start = hour
-                hour_end = hour + 1
+                # Hour N in the JSON represents the time from N:00 to (N+1):00
+                # But hour index in loop is 0-23, so hour_start = hour, hour_end = hour + 1
+                hour_start = float(hour)
+                hour_end = float(hour + 1)
+                hour_mid = hour + 0.5
                 
-                # Check if this hour overlaps with outage period
-                outage_start = start_hour + (start_min / 60)
-                outage_end = end_hour + (end_min / 60)
+                # Skip if no overlap
+                if outage_end <= hour_start or outage_start >= hour_end:
+                    continue
                 
-                # Full hour outage
-                if outage_start <= hour_start and outage_end >= hour_end:
+                # Calculate overlap
+                overlap_start = max(outage_start, hour_start)
+                overlap_end = min(outage_end, hour_end)
+                overlap_duration = overlap_end - overlap_start
+                
+                # Determine the status based on overlap
+                if overlap_duration >= 1.0:
+                    # Full hour outage
                     hours[str(hour + 1)] = "no"
-                # Partial hour outage - first half
-                elif outage_start <= hour_start and outage_end > hour_start and outage_end < hour_start + 0.5:
-                    if hours[str(hour + 1)] == "yes":
-                        hours[str(hour + 1)] = "first"
-                # Partial hour outage - second half
-                elif outage_start >= hour_start + 0.5 and outage_start < hour_end and outage_end >= hour_end:
-                    if hours[str(hour + 1)] == "yes":
-                        hours[str(hour + 1)] = "second"
-                # Overlaps but not fully contained - mark as no power for safety
-                elif (outage_start < hour_end and outage_end > hour_start):
-                    if hours[str(hour + 1)] not in ["no", "first", "second"]:
+                elif overlap_duration > 0:
+                    # Partial hour outage
+                    # Check if outage is in first half or second half
+                    if overlap_start < hour_mid and overlap_end <= hour_mid:
+                        # Outage only in first half (00-30 minutes)
+                        if hours[str(hour + 1)] == "yes":
+                            hours[str(hour + 1)] = "first"
+                        elif hours[str(hour + 1)] == "second":
+                            hours[str(hour + 1)] = "no"  # Both halves affected
+                    elif overlap_start >= hour_mid and overlap_end > hour_mid:
+                        # Outage only in second half (30-60 minutes)
+                        if hours[str(hour + 1)] == "yes":
+                            hours[str(hour + 1)] = "second"
+                        elif hours[str(hour + 1)] == "first":
+                            hours[str(hour + 1)] = "no"  # Both halves affected
+                    else:
+                        # Outage spans both halves or is ambiguous - mark as full outage
                         hours[str(hour + 1)] = "no"
         
         return hours
