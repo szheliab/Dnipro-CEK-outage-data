@@ -34,7 +34,7 @@ jobs:
       
       - name: Run scraper
         env:
-          TELEGRAM_URL: ${{ secrets.TELEGRAM_URL }}
+          TELEGRAM_URL: ${{ vars.TELEGRAM_URL }}
         run: |
           python scraper.py \
             --url "$TELEGRAM_URL" \
