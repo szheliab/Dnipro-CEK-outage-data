@@ -2,8 +2,9 @@ name: Update Powercut Schedule
 
 on:
   schedule:
-    # Run every hour at minute 15
-    - cron: '15 * * * *'
+    # Runs every 5 minutes at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
+    # NOTE: GitHub Actions cron uses UTC time. Adjust if you need specific local times.
+    - cron: '*/5 * * * *'
   workflow_dispatch: # Allow manual trigger
   push:
     branches:
