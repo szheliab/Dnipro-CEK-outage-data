@@ -95,7 +95,7 @@ class PowercutScraper:
     
     def apply_modifications(self, schedules: Dict[str, Dict[float, List[str]]], 
                            modifications: Dict[str, Dict[float, List[str]]]):
-        """Apply schedule modifications (prolongations, early starts) to existing schedules
+        """Apply schedule modifications (prolongations, early starts, additional outages) to existing schedules
         
         Args:
             schedules: The main schedules dict to modify
@@ -107,19 +107,29 @@ class PowercutScraper:
             
             for queue_num, mod_list in queue_mods.items():
                 for mod in mod_list:
-                    # Parse modification: "MOD:prolong:13:00" or "MOD:early_start:11:00"
-                    parts = mod.split(':')
+                    # Parse modification: "MOD:prolong:13:00" or "MOD:early_start:11:00" or "MOD:additional:06:00-09:00"
+                    parts = mod.split(':', 2)  # Split into max 3 parts
                     if len(parts) >= 3:
                         mod_type = parts[1]
-                        mod_time = f"{parts[2]}:{parts[3]}"
+                        mod_data = parts[2]
                         
-                        if queue_num in schedules[date]:
+                        if mod_type == 'additional':
+                            # Additional outage is a new time slot to add
+                            if queue_num not in schedules[date]:
+                                schedules[date][queue_num] = []
+                            schedules[date][queue_num].append(mod_data)
+                            # Recombine after adding
+                            schedules[date][queue_num] = self.combine_time_slots(date, schedules[date][queue_num])
+                            print(f"Added additional outage {mod_data} to queue {queue_num} on {date}")
+                        
+                        elif queue_num in schedules[date]:
                             existing_slots = schedules[date][queue_num]
                             modified_slots = self.modify_time_slots(
-                                existing_slots, mod_type, mod_time, date
+                                existing_slots, mod_type, mod_data, date
                             )
                             schedules[date][queue_num] = modified_slots
                             print(f"Applied {mod_type} modification to queue {queue_num} on {date}: {modified_slots}")
+                        
                         elif mod_type == 'cancel':
                             # Remove the queue if cancelled
                             if queue_num in schedules[date]:
@@ -142,26 +152,73 @@ class PowercutScraper:
         if not time_slots:
             return time_slots
         
-        modified = []
+        current_time = datetime.now()
         
-        for slot in time_slots:
-            start_time, end_time = slot.split('-')
+        if mod_type == 'prolong':
+            # Find which slot to prolong
+            # Strategy: Find the slot that is currently ongoing or the last slot that ended most recently
+            slot_to_modify = None
+            slot_index = None
             
-            if mod_type == 'prolong':
-                # Extend the end time of the last slot
-                modified.append(f"{start_time}-{mod_time}")
-            elif mod_type == 'early_start':
-                # Start the first slot earlier
-                modified.append(f"{mod_time}-{end_time}")
-            else:
-                modified.append(slot)
-        
-        # If prolonging, update only the last slot
-        if mod_type == 'prolong' and len(time_slots) > 1:
-            modified = time_slots[:-1] + [f"{time_slots[-1].split('-')[0]}-{mod_time}"]
-        # If early start, update only the first slot
-        elif mod_type == 'early_start' and len(time_slots) > 1:
-            modified = [f"{mod_time}-{time_slots[0].split('-')[1]}"] + time_slots[1:]
+            for idx, slot in enumerate(time_slots):
+                start_time_str, end_time_str = slot.split('-')
+                try:
+                    slot_start = datetime.strptime(f"{date} {start_time_str}", "%d.%m.%Y %H:%M")
+                    slot_end = datetime.strptime(f"{date} {end_time_str}", "%d.%m.%Y %H:%M")
+                    
+                    # Check if this slot is currently ongoing
+                    if slot_start <= current_time <= slot_end:
+                        slot_to_modify = idx
+                        break
+                    
+                    # Check if this slot just ended (within last 2 hours) - might be getting extended
+                    elif current_time > slot_end and (current_time - slot_end).total_seconds() < 7200:
+                        slot_to_modify = idx
+                except:
+                    continue
+            
+            # If no specific slot found, extend the last one (default behavior)
+            if slot_to_modify is None:
+                slot_to_modify = len(time_slots) - 1
+            
+            # Modify the identified slot
+            modified = time_slots.copy()
+            start_time = modified[slot_to_modify].split('-')[0]
+            modified[slot_to_modify] = f"{start_time}-{mod_time}"
+            
+            print(f"  Prolonging slot {slot_to_modify + 1} of {len(time_slots)}: {time_slots[slot_to_modify]} → {modified[slot_to_modify]}")
+            
+        elif mod_type == 'early_start':
+            # Find which slot to start earlier
+            # Strategy: Find the first slot that hasn't started yet or is currently ongoing
+            slot_to_modify = None
+            
+            for idx, slot in enumerate(time_slots):
+                start_time_str, end_time_str = slot.split('-')
+                try:
+                    slot_start = datetime.strptime(f"{date} {start_time_str}", "%d.%m.%Y %H:%M")
+                    slot_end = datetime.strptime(f"{date} {end_time_str}", "%d.%m.%Y %H:%M")
+                    
+                    # Check if this slot hasn't started yet or is ongoing
+                    if current_time <= slot_end:
+                        slot_to_modify = idx
+                        break
+                except:
+                    continue
+            
+            # If no specific slot found, modify the first one (default behavior)
+            if slot_to_modify is None:
+                slot_to_modify = 0
+            
+            # Modify the identified slot
+            modified = time_slots.copy()
+            end_time = modified[slot_to_modify].split('-')[1]
+            modified[slot_to_modify] = f"{mod_time}-{end_time}"
+            
+            print(f"  Early start for slot {slot_to_modify + 1} of {len(time_slots)}: {time_slots[slot_to_modify]} → {modified[slot_to_modify]}")
+            
+        else:
+            modified = time_slots
         
         # Recombine slots in case modification created overlap
         return self.combine_time_slots(date, modified)
@@ -237,35 +294,64 @@ class PowercutScraper:
         
         # Pattern for prolongation: "до 13:00 подовжено відключення підчерги 2.1"
         prolong_pattern = re.compile(
-            r'до\s(\d{2}:\d{2})\sподовжен[оа]\s+(?:відключення\s+)?(?:під)?черг[аиу]\s+([\d.]+)', 
+            r'до\s(\d{2}:\d{2})\sподовжен[оа]\s+(?:відключення\s+)?(?:під)?черг[аиу]?\s+([\d.,\s]+)', 
             re.IGNORECASE
         )
         for match in prolong_pattern.finditer(message):
             time = match.group(1)
-            queue = float(match.group(2))
-            modifications.append((queue, 'prolong', time))
-            print(f"Found prolongation for queue {queue} until {time}")
+            queues_str = match.group(2)
+            # Extract all queue numbers from the string
+            queue_numbers = re.findall(r'[\d.]+', queues_str)
+            for queue_str in queue_numbers:
+                try:
+                    queue = float(queue_str)
+                    modifications.append((queue, 'prolong', time))
+                    print(f"Found prolongation for queue {queue} until {time}")
+                except ValueError:
+                    continue
         
-        # Pattern for early start: "з 11:00 додатково застосовуватиметься відключення підчерги 4.2"
-        early_pattern = re.compile(
-            r'з\s(\d{2}:\d{2})\s+додатково\s+(?:застосовуватиметься|застосовується)\s+(?:відключення\s+)?(?:під)?черг[аиу]\s+([\d.]+)',
+        # Pattern for additional outage: "з 06:00 до 09:00 додатково застосовуватиметься відключення підчерг 1.1, 1.2 та 3.1"
+        # This pattern handles time range (from-to) with multiple queues
+        additional_pattern = re.compile(
+            r'з\s(\d{2}:\d{2})(?:\sдо\s(\d{2}:\d{2}))?\s+додатково\s+(?:застосовуватиметься|застосовується)\s+(?:відключення\s+)?(?:під)?черг[аиу]?\s+([\d.,\sіта]+)',
             re.IGNORECASE
         )
-        for match in early_pattern.finditer(message):
-            time = match.group(1)
-            queue = float(match.group(2))
-            modifications.append((queue, 'early_start', time))
-            print(f"Found early start for queue {queue} at {time}")
+        for match in additional_pattern.finditer(message):
+            start_time = match.group(1)
+            end_time = match.group(2) if match.group(2) else None
+            queues_str = match.group(3)
+            
+            # Extract all queue numbers from the string (handles "1.1, 1.2 та 3.1")
+            queue_numbers = re.findall(r'[\d.]+', queues_str)
+            
+            for queue_str in queue_numbers:
+                try:
+                    queue = float(queue_str)
+                    # If there's an end time, this is a new outage slot, not just early start
+                    if end_time:
+                        modifications.append((queue, 'additional', f"{start_time}-{end_time}"))
+                        print(f"Found additional outage for queue {queue} from {start_time} to {end_time}")
+                    else:
+                        modifications.append((queue, 'early_start', start_time))
+                        print(f"Found early start for queue {queue} at {start_time}")
+                except ValueError:
+                    continue
         
         # Pattern for cancellation: "скасовано відключення черги 3.1"
         cancel_pattern = re.compile(
-            r'скасован[оа]\s+(?:відключення\s+)?(?:під)?черг[аиу]\s+([\d.]+)',
+            r'скасован[оа]\s+(?:відключення\s+)?(?:під)?черг[аиу]?\s+([\d.,\s]+)',
             re.IGNORECASE
         )
         for match in cancel_pattern.finditer(message):
-            queue = float(match.group(1))
-            modifications.append((queue, 'cancel', '00:00'))
-            print(f"Found cancellation for queue {queue}")
+            queues_str = match.group(1)
+            queue_numbers = re.findall(r'[\d.]+', queues_str)
+            for queue_str in queue_numbers:
+                try:
+                    queue = float(queue_str)
+                    modifications.append((queue, 'cancel', '00:00'))
+                    print(f"Found cancellation for queue {queue}")
+                except ValueError:
+                    continue
         
         return modifications
 
