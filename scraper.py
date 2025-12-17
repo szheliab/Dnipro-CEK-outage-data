@@ -10,7 +10,8 @@ import re
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Set
 import argparse
 
@@ -28,6 +29,59 @@ class PowercutScraper:
         }
         self.current_year = datetime.now().year
 
+    def cleanup_old_data(self, data: dict) -> dict:
+        """Remove data for dates before today (Kyiv timezone)
+        
+        Args:
+            data: The JSON data structure to clean up
+            
+        Returns:
+            Cleaned data with only today and future dates
+        """
+        try:
+            # Get current time in Kyiv timezone
+            kyiv_tz = ZoneInfo('Europe/Kyiv')
+            now_kyiv = datetime.now(kyiv_tz)
+            today_midnight_kyiv = now_kyiv.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # Convert to Unix timestamp for comparison
+            today_timestamp = int(today_midnight_kyiv.timestamp())
+            
+            print(f"Cleanup: Current Kyiv time: {now_kyiv.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"Cleanup: Today midnight timestamp: {today_timestamp}")
+            
+            # Get all timestamps from the data
+            if "fact" not in data or "data" not in data["fact"]:
+                print("Cleanup: No fact data found in JSON")
+                return data
+            
+            old_timestamps = list(data["fact"]["data"].keys())
+            
+            # Remove timestamps older than today
+            removed_count = 0
+            for timestamp_str in old_timestamps:
+                timestamp = int(timestamp_str)
+                if timestamp < today_timestamp:
+                    del data["fact"]["data"][timestamp_str]
+                    removed_count += 1
+                    # Convert timestamp to readable date
+                    date_obj = datetime.fromtimestamp(timestamp, tz=kyiv_tz)
+                    print(f"Cleanup: Removed old data for {date_obj.strftime('%Y-%m-%d')}")
+            
+            if removed_count == 0:
+                print("Cleanup: No old data to remove")
+            else:
+                print(f"Cleanup: Removed {removed_count} old date(s)")
+            
+            # Update the today field
+            data["fact"]["today"] = today_timestamp
+            
+            return data
+            
+        except Exception as e:
+            print(f"Warning: Cleanup failed: {e}")
+            return data
+
     def scrape_messages(self) -> Dict[str, Dict[float, List[str]]]:
         """Scrape messages from Telegram channel and extract schedules for ALL queues
         
@@ -44,22 +98,53 @@ class PowercutScraper:
 
         # Parse the webpage content
         soup = BeautifulSoup(response.content, 'html.parser')
-        messages = soup.find_all('div', class_='tgme_widget_message_text')
+        
+        # Find all message widgets (full message containers, not just text)
+        message_widgets = soup.find_all('div', class_='tgme_widget_message')
+
+        # Get today's date in Kyiv timezone
+        kyiv_tz = ZoneInfo('Europe/Kyiv')
+        today = datetime.now(kyiv_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_str = today.strftime("%d.%m.%Y")
 
         # Collect all schedules: date -> queue_number -> time_slots
         all_schedules = {}
         modifications_by_date = {}
         
-        for message in messages:
-            date = self.extract_date(message.get_text())
+        for message_widget in message_widgets:
+            # Extract message timestamp from datetime attribute
+            message_timestamp = self.extract_message_timestamp(message_widget)
+            
+            # Get message text
+            message_text_div = message_widget.find('div', class_='tgme_widget_message_text')
+            if not message_text_div:
+                continue
+                
+            message_text = message_text_div.get_text()
+            
             # Extract schedules for ALL queues
-            schedules_by_queue = self.extract_all_schedules(message.get_text())
+            schedules_by_queue = self.extract_all_schedules(message_text)
+            
+            # Extract date from message - if not found, assume today for modifications
+            date = self.extract_date(message_text)
+            
+            # If no date found but message has modifications, use today's date
+            if not date and schedules_by_queue:
+                # Check if this message contains only modifications
+                has_modifications = any(
+                    any(slot.startswith("MOD:") for slot in slots)
+                    for slots in schedules_by_queue.values()
+                )
+                if has_modifications:
+                    date = today_str
+                    print(f"No date in modification message, using today: {date}")
             
             if date and schedules_by_queue:
                 date_obj = datetime.strptime(date, "%d.%m.%Y")
+                # Make date_obj timezone-aware
+                date_obj = date_obj.replace(tzinfo=kyiv_tz)
                 
                 # Only process today or future dates
-                today = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
                 if date_obj >= today:
                     if date not in all_schedules:
                         all_schedules[date] = {}
@@ -73,7 +158,17 @@ class PowercutScraper:
                         
                         for slot in time_slots:
                             if slot.startswith("MOD:"):
-                                mods.append(slot)
+                                # Only accept modifications if message was posted today
+                                if message_timestamp and self.is_message_from_today(message_timestamp, kyiv_tz):
+                                    mods.append(slot)
+                                    msg_time = message_timestamp.strftime('%H:%M')
+                                    print(f"Accepting modification for queue {queue_num} from today's message ({msg_time}): {slot}")
+                                else:
+                                    if message_timestamp:
+                                        msg_date = message_timestamp.strftime('%Y-%m-%d %H:%M')
+                                        print(f"Skipping modification for queue {queue_num} from {msg_date} (not today): {slot}")
+                                    else:
+                                        print(f"Skipping modification for queue {queue_num} (no timestamp available): {slot}")
                             else:
                                 regular_slots.append(slot)
                         
@@ -92,6 +187,53 @@ class PowercutScraper:
         self.apply_modifications(all_schedules, modifications_by_date)
         
         return all_schedules
+    
+    def extract_message_timestamp(self, message_widget) -> Optional[datetime]:
+        """Extract the timestamp when a message was posted
+        
+        Args:
+            message_widget: BeautifulSoup element for the message widget
+            
+        Returns:
+            datetime object in Kyiv timezone, or None if not found
+        """
+        try:
+            # Look for the time element using the same selector as Home Assistant
+            # CSS selector: .tgme_widget_message_meta a.tgme_widget_message_date time.time
+            meta_div = message_widget.find('div', class_='tgme_widget_message_meta')
+            if meta_div:
+                date_link = meta_div.find('a', class_='tgme_widget_message_date')
+                if date_link:
+                    time_tag = date_link.find('time', class_='time', attrs={'datetime': True})
+                    if time_tag:
+                        datetime_str = time_tag['datetime']
+                        # Parse ISO format datetime (e.g., "2025-12-08T10:30:00+02:00")
+                        msg_datetime = datetime.fromisoformat(datetime_str)
+                        
+                        # Convert to Kyiv timezone
+                        kyiv_tz = ZoneInfo('Europe/Kyiv')
+                        msg_datetime_kyiv = msg_datetime.astimezone(kyiv_tz)
+                        
+                        return msg_datetime_kyiv
+        except Exception as e:
+            print(f"Warning: Could not extract message timestamp: {e}")
+        
+        return None
+    
+    def is_message_from_today(self, message_timestamp: datetime, kyiv_tz) -> bool:
+        """Check if a message timestamp is from today (Kyiv timezone)
+        
+        Args:
+            message_timestamp: datetime object of the message
+            kyiv_tz: ZoneInfo for Kyiv timezone
+            
+        Returns:
+            True if message is from today, False otherwise
+        """
+        today = datetime.now(kyiv_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        
+        return today <= message_timestamp < tomorrow
     
     def apply_modifications(self, schedules: Dict[str, Dict[float, List[str]]], 
                            modifications: Dict[str, Dict[float, List[str]]]):
@@ -414,8 +556,11 @@ class PowercutScraper:
         else:
             data = self.create_json_structure()
         
+        # Clean up old data (dates before today in Kyiv timezone)
+        data = self.cleanup_old_data(data)
+        
         # Update lastUpdated timestamp
-        data["lastUpdated"] = datetime.utcnow().isoformat() + "Z"
+        data["lastUpdated"] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         
         # Get all unique queue numbers from all dates
         all_queues = set()
@@ -451,24 +596,28 @@ class PowercutScraper:
         # Update fact metadata
         data["fact"]["update"] = datetime.now().strftime("%d.%m.%Y %H:%M")
         
-        # Set today's timestamp
-        today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Set today's timestamp (using Kyiv timezone)
+        kyiv_tz = ZoneInfo('Europe/Kyiv')
+        today_midnight = datetime.now(kyiv_tz).replace(hour=0, minute=0, second=0, microsecond=0)
         data["fact"]["today"] = int(today_midnight.timestamp())
         
         # Update lastUpdateStatus
-        data["lastUpdateStatus"]["at"] = datetime.utcnow().isoformat() + "Z"
+        data["lastUpdateStatus"]["at"] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         
         return data
 
     def create_json_structure(self) -> dict:
         """Create initial JSON structure following dnipro.json schema"""
+        kyiv_tz = ZoneInfo('Europe/Kyiv')
+        today_midnight = datetime.now(kyiv_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        
         return {
             "regionId": self.region_id,
-            "lastUpdated": datetime.utcnow().isoformat() + "Z",
+            "lastUpdated": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             "fact": {
                 "data": {},
                 "update": datetime.now().strftime("%d.%m.%Y %H:%M"),
-                "today": int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                "today": int(today_midnight.timestamp())
             },
             "preset": self.get_preset_data(),
             "lastUpdateStatus": {
@@ -476,7 +625,7 @@ class PowercutScraper:
                 "ok": True,
                 "code": 200,
                 "message": None,
-                "at": datetime.utcnow().isoformat() + "Z",
+                "at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                 "attempt": 1
             },
             "meta": {
