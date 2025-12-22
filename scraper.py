@@ -571,10 +571,13 @@ class PowercutScraper:
         
         # Process each date and its schedules
         for date_str, queues_schedules in schedules.items():
+            # Parse date string and make it timezone-aware in Kyiv timezone
             date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+            kyiv_tz = ZoneInfo('Europe/Kyiv')
+            date_obj = date_obj.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=kyiv_tz)
             
-            # Convert to Unix timestamp (midnight of that day)
-            timestamp = int(date_obj.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            # Convert to Unix timestamp (midnight Kyiv time, not UTC)
+            timestamp = int(date_obj.timestamp())
             timestamp_key = str(timestamp)
             
             # Initialize date entry if it doesn't exist
